@@ -1,0 +1,270 @@
+name: Seed Hydraulic Suite
+on: { workflow_dispatch: {} }
+permissions: { contents: write }
+
+jobs:
+  seed:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p infra apps/api/{src/modules/{jobs,assets},prisma} apps/web/{public,src/{lib,pages/{jobs,assets}}}
+
+          # README
+          cat > README.md <<'EOF'
+          # Hydraulic Suite (Docker stack)
+          - Postgres + Prisma (Jobs, Assets)
+          - API: NestJS (basic CRUD)
+          - Web: Next.js PWA (lists Jobs/Assets)
+          ## Run
+          cd infra && docker compose up --build -d
+          API:  http://<server-ip>:3000/api
+          Web:  http://<server-ip>:3001
+          EOF
+
+          # docker-compose
+          cat > infra/docker-compose.yml <<'EOF'
+          services:
+            postgres:
+              image: postgres:16-alpine
+              environment:
+                POSTGRES_USER: postgres
+                POSTGRES_PASSWORD: postgres
+                POSTGRES_DB: hydraulic
+              ports: ["5432:5432"]
+              healthcheck:
+                test: ["CMD-SHELL","pg_isready -U postgres"]
+                interval: 5s
+                timeout: 5s
+                retries: 10
+              volumes: [ "pgdata:/var/lib/postgresql/data" ]
+
+            api:
+              build: ../apps/api
+              environment:
+                - PORT=3000
+                - DATABASE_URL=${DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/hydraulic?schema=public}
+              depends_on:
+                postgres:
+                  condition: service_healthy
+              ports: ["3000:3000"]
+              command: >
+                sh -c "npm exec prisma db push -- --schema=/app/prisma/schema.prisma &&
+                       node dist/main.js"
+
+            web:
+              build: ../apps/web
+              environment:
+                - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:3000}
+              depends_on: [ api ]
+              ports: ["3001:3001"]
+              command: ["npm","start","-p","3001"]
+
+          volumes: { pgdata: {} }
+          EOF
+
+          # ---------- API (NestJS minimal) ----------
+          cat > apps/api/package.json <<'EOF'
+          { "name":"hydraulic-api","private":true,"type":"module",
+            "scripts":{"build":"tsc -p tsconfig.json","start":"node dist/main.js","dev":"ts-node --transpile-only src/main.ts",
+              "prisma:generate":"prisma generate --schema=./prisma/schema.prisma","db:push":"prisma db push --schema=./prisma/schema.prisma"},
+            "dependencies":{"@nestjs/common":"^10.3.0","@nestjs/core":"^10.3.0","@nestjs/platform-express":"^10.3.0","@prisma/client":"5.18.0","cors":"^2.8.5","express":"^4.18.2","helmet":"^7.0.0","reflect-metadata":"^0.1.13","rxjs":"^7.8.1"},
+            "devDependencies":{"prisma":"5.18.0","ts-node":"10.9.2","typescript":"5.4.5"} }
+          EOF
+          cat > apps/api/tsconfig.json <<'EOF'
+          { "compilerOptions":{"module":"es2022","target":"es2022","moduleResolution":"node","outDir":"dist","emitDecoratorMetadata":true,"experimentalDecorators":true,"strict":false,"skipLibCheck":true}, "include":["src/**/*"] }
+          EOF
+          # Debian base to avoid OpenSSL hiccups
+          cat > apps/api/Dockerfile <<'EOF'
+          FROM node:20-bookworm-slim AS deps
+          WORKDIR /app
+          RUN apt-get update && apt-get install -y --no-install-recommends openssl ca-certificates && rm -rf /var/lib/apt/lists/*
+          COPY package.json tsconfig.json ./
+          RUN npm install
+          FROM node:20-bookworm-slim AS builder
+          WORKDIR /app
+          COPY --from=deps /app /app
+          COPY prisma ./prisma
+          COPY src ./src
+          RUN npx prisma generate --schema=./prisma/schema.prisma
+          RUN npm run build
+          FROM node:20-bookworm-slim
+          WORKDIR /app
+          ENV NODE_ENV=production
+          RUN apt-get update && apt-get install -y --no-install-recommends openssl ca-certificates && rm -rf /var/lib/apt/lists/*
+          COPY --from=builder /app/dist ./dist
+          COPY --from=builder /app/prisma ./prisma
+          COPY package.json ./
+          EXPOSE 3000
+          CMD ["node","dist/main.js"]
+          EOF
+
+          # Prisma schema (Jobs, Assets)
+          cat > apps/api/prisma/schema.prisma <<'EOF'
+          generator client { provider = "prisma-client-js"; binaryTargets = ["native","debian-openssl-3.0.x"] }
+          datasource db { provider = "postgresql"; url = env("DATABASE_URL") }
+          model Job { id String @id @default(uuid()) description String? status String @default("NEW") createdAt DateTime @default(now()) updatedAt DateTime @updatedAt }
+          model Asset { id String @id @default(uuid()) tag String @unique make String? model String? createdAt DateTime @default(now()) updatedAt DateTime @updatedAt }
+          EOF
+
+          # Nest app (health + jobs/assets)
+          cat > apps/api/src/main.ts <<'EOF'
+          import 'reflect-metadata'
+          import { NestFactory } from '@nestjs/core'
+          import { AppModule } from './app.module.js'
+          import helmet from 'helmet'
+          import cors from 'cors'
+          async function bootstrap(){
+            const app = await NestFactory.create(AppModule, { logger: ['log','error','warn'] })
+            app.use(helmet()); app.use(cors()); app.setGlobalPrefix('api')
+            const port = process.env.PORT || 3000
+            await app.listen(port as number)
+            console.log(`API listening on :${port}/api`)
+          }
+          bootstrap()
+          EOF
+          cat > apps/api/src/app.module.ts <<'EOF'
+          import { Module, Controller, Get } from '@nestjs/common'
+          import { PrismaService } from './prisma.service.js'
+          import { JobsModule } from './modules/jobs/jobs.module.js'
+          import { AssetsModule } from './modules/assets/assets.module.js'
+          @Controller('health') class Health { @Get() ok(){ return { ok:true, ts:new Date().toISOString() } } }
+          @Module({ imports:[JobsModule,AssetsModule], providers:[PrismaService], controllers:[Health] })
+          export class AppModule {}
+          EOF
+          cat > apps/api/src/prisma.service.ts <<'EOF'
+          import { Injectable } from '@nestjs/common'; import { PrismaClient } from '@prisma/client'; @Injectable() export class PrismaService extends PrismaClient {}
+          EOF
+          # jobs
+          mkdir -p apps/api/src/modules/jobs
+          cat > apps/api/src/modules/jobs/jobs.controller.ts <<'EOF'
+          import { Controller, Get, Param, Post, Put, Delete, Body } from '@nestjs/common'
+          import { JobsService } from './jobs.service.js'
+          @Controller('jobs') export class JobsController {
+            constructor(private svc: JobsService) {}
+            @Get() list(){ return this.svc.list() }
+            @Get(':id') get(@Param('id') id:string){ return this.svc.get(id) }
+            @Post() create(@Body() data:any){ return this.svc.create(data) }
+            @Put(':id') update(@Param('id') id:string,@Body() data:any){ return this.svc.update(id,data) }
+            @Delete(':id') remove(@Param('id') id:string){ return this.svc.remove(id) }
+          }
+          EOF
+          cat > apps/api/src/modules/jobs/jobs.service.ts <<'EOF'
+          import { Injectable } from '@nestjs/common'; import { PrismaService } from '../../prisma.service.js'
+          @Injectable() export class JobsService {
+            constructor(private prisma: PrismaService){}
+            list(){ return this.prisma.job.findMany({ orderBy:{ createdAt:'desc' } }) }
+            get(id:string){ return this.prisma.job.findUnique({ where:{ id } }) }
+            create(data:any){ return this.prisma.job.create({ data }) }
+            update(id:string, data:any){ return this.prisma.job.update({ where:{ id }, data }) }
+            remove(id:string){ return this.prisma.job.delete({ where:{ id } }) }
+          }
+          EOF
+          cat > apps/api/src/modules/jobs/jobs.module.ts <<'EOF'
+          import { Module } from '@nestjs/common'
+          import { JobsController } from './jobs.controller.js'
+          import { JobsService } from './jobs.service.js'
+          import { PrismaService } from '../../prisma.service.js'
+          @Module({ controllers:[JobsController], providers:[JobsService,PrismaService] })
+          export class JobsModule {}
+          EOF
+          # assets
+          mkdir -p apps/api/src/modules/assets
+          cat > apps/api/src/modules/assets/assets.controller.ts <<'EOF'
+          import { Controller, Get, Body, Post } from '@nestjs/common'
+          import { AssetsService } from './assets.service.js'
+          @Controller('assets') export class AssetsController {
+            constructor(private svc: AssetsService){}
+            @Get() list(){ return this.svc.list() }
+            @Post() create(@Body() data:any){ return this.svc.create(data) }
+          }
+          EOF
+          cat > apps/api/src/modules/assets/assets.service.ts <<'EOF'
+          import { Injectable } from '@nestjs/common'; import { PrismaService } from '../../prisma.service.js'
+          @Injectable() export class AssetsService {
+            constructor(private prisma: PrismaService){}
+            list(){ return this.prisma.asset.findMany({ orderBy:{ createdAt:'desc' } }) }
+            create(data:any){ return this.prisma.asset.create({ data }) }
+          }
+          EOF
+          cat > apps/api/src/modules/assets/assets.module.ts <<'EOF'
+          import { Module } from '@nestjs/common'
+          import { AssetsController } from './assets.controller.js'
+          import { AssetsService } from './assets.service.js'
+          import { PrismaService } from '../../prisma.service.js'
+          @Module({ controllers:[AssetsController], providers:[AssetsService,PrismaService] })
+          export class AssetsModule {}
+          EOF
+
+          # ---------- Web (Next.js minimal PWA) ----------
+          cat > apps/web/package.json <<'EOF'
+          { "name":"hydraulic-web","private":true,"type":"module",
+            "scripts":{"dev":"next dev -p 3001","build":"next build","start":"next start -p 3001"},
+            "dependencies":{"next":"14.2.5","react":"18.2.0","react-dom":"18.2.0","swr":"2.2.5"},
+            "devDependencies":{"typescript":"5.4.5"} }
+          EOF
+          cat > apps/web/tsconfig.json <<'EOF'
+          { "compilerOptions":{"target":"ES2022","lib":["dom","dom.iterable","es2022"],"skipLibCheck":true,"strict":false,"forceConsistentCasingInFileNames":true,"noEmit":true,"esModuleInterop":true,"module":"esnext","moduleResolution":"bundler","resolveJsonModule":true,"isolatedModules":true,"jsx":"preserve","incremental":true}, "include":["next-env.d.ts","**/*.ts","**/*.tsx"] }
+          EOF
+          cat > apps/web/next.config.mjs <<'EOF'
+          export default { output: 'standalone' }
+          EOF
+          cat > apps/web/public/sw.js <<'EOF'
+          self.addEventListener('install', e => { e.waitUntil(caches.open('hydraulic-cache-v1').then(c => c.addAll(['/','/jobs','/assets']))) })
+          self.addEventListener('fetch', e => { e.respondWith(caches.match(e.request).then(r => r || fetch(e.request).then(res => { const c=res.clone(); caches.open('hydraulic-cache-v1').then(x=>x.put(e.request,c)); return res }).catch(()=>r))) })
+          EOF
+          mkdir -p apps/web/src/pages
+          cat > apps/web/src/pages/_app.tsx <<'EOF'
+          import { useEffect } from 'react'
+          export default function MyApp({ Component, pageProps }){
+            useEffect(()=>{ if('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(console.error) },[])
+            return <Component {...pageProps} />
+          }
+          EOF
+          cat > apps/web/src/lib/api.ts <<'EOF'
+          const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000'
+          export async function api(path, init){ const r = await fetch(`${API}/api${path}`, { ...init }); if(!r.ok) throw new Error(await r.text()); return r.json() }
+          EOF
+          cat > apps/web/src/pages/index.tsx <<'EOF'
+          import Link from 'next/link'
+          export default function Home(){
+            return <main style={{padding:24,fontFamily:'system-ui'}}>
+              <h1>Hydraulic Fittings Suite</h1>
+              <ul><li><Link href="/jobs">Jobs</Link></li><li><Link href="/assets">Assets</Link></li></ul>
+              <p>Set <code>NEXT_PUBLIC_API_URL</code> to your API URL.</p>
+            </main>
+          }
+          EOF
+          cat > apps/web/src/pages/jobs/index.tsx <<'EOF'
+          import useSWR from 'swr'; import { api } from '../../lib/api'
+          export default function Jobs(){ const {data,error}=useSWR('/jobs',api); if(error) return <div>Error: {String(error)}</div>; if(!data) return <div>Loading…</div>;
+          return <main style={{padding:24}}><h1>Jobs</h1><ul>{data.map((j:any)=>(<li key={j.id}>{j.description||'Job'} — {j.status}</li>))}</ul></main> }
+          EOF
+          cat > apps/web/src/pages/assets/index.tsx <<'EOF'
+          import useSWR from 'swr'; import { api } from '../../lib/api'
+          export default function Assets(){ const {data,error}=useSWR('/assets',api); if(error) return <div>Error: {String(error)}</div>; if(!data) return <div>Loading…</div>;
+          return <main style={{padding:24}}><h1>Assets</h1><ul>{data.map((a:any)=>(<li key={a.id}>{a.tag} — {a.make||''} {a.model||''}</li>))}</ul></main> }
+          EOF
+
+          # ---------- Commit & push ----------
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -m "seed: initial hydraulic suite"
+          git push
+
+      - name: Zip project (artifact)
+        run: |
+          cd $GITHUB_WORKSPACE
+          zip -r hydraulic-suite-complete-opensslfix.zip .
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hydraulic-suite-complete-opensslfix
+          path: hydraulic-suite-complete-opensslfix.zip
+          if-no-files-found: error
